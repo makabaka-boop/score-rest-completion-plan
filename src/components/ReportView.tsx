@@ -31,6 +31,7 @@ export function ReportView({ result, stale }: Props) {
 
       <FirstErrorCard result={result} />
       <EndingCard result={result} />
+      <FillPlanCard result={result} />
 
       {result.voices.map((v, vi) => (
         <details key={`${v.name}-${vi}`} className="voice-details">
@@ -138,6 +139,72 @@ function FirstErrorCard({ result }: { result: VerifyResult }) {
           （每个事件的 id 在同一声部内必须唯一）。
         </span>
       )}
+    </div>
+  );
+}
+
+function FillPlanCard({ result }: { result: VerifyResult }) {
+  const plan = result.fillPlan;
+  const short = plan.voices.filter((p) => p.deficit[0] !== 0n);
+  if (short.length === 0) {
+    return (
+      <div className="card ok" data-testid="fill-plan-card">
+        <strong>休止符补齐：</strong>各声部均已到达共同小节线，无需补齐。
+      </div>
+    );
+  }
+  const failed = short.filter((p) => !p.fillable);
+  return (
+    <div className={`card ${failed.length ? "bad" : ""}`} data-testid="fill-plan-card">
+      <strong>休止符补齐清单</strong>
+      <span className="fill-target">
+        目标：第 {result.targetBars.toString()} 小节线（{fracText(plan.targetEnd)}{" "}
+        全音符）· 各段符号数最少，并列时靠前时值较长者优先 · 休止符均不跨小节线
+      </span>
+      {failed.length > 0 && (
+        <p className="fill-warning">
+          以下声部存在无法由允许时值（分母 1/2/4/8/16/32 × 附点 × 三连音）精确组成的缺口，
+          按规则不给出部分清单：
+        </p>
+      )}
+      <table className="event-table compact fill-table">
+        <thead>
+          <tr>
+            <th>声部</th>
+            <th>小节</th>
+            <th>起点</th>
+            <th>终点</th>
+            <th>时值属性</th>
+            <th>时值（全音符分数）</th>
+          </tr>
+        </thead>
+        <tbody>
+          {short.map((p) =>
+            p.fillable ? (
+              p.rests.map((r, i) => (
+                <tr key={`${p.voiceIndex}-${i}`}>
+                  <td>{p.voiceName}</td>
+                  <td>{r.bar}</td>
+                  <td className="mono">{fracText(r.start)}</td>
+                  <td className="mono">{fracText(r.end)}</td>
+                  <td>{durationLabel(r)}</td>
+                  <td className="mono">{fracText(r.duration)}</td>
+                </tr>
+              ))
+            ) : (
+              <tr key={`${p.voiceIndex}-fail`} className="row-deficit">
+                <td>{p.voiceName}</td>
+                <td>{p.failure!.bar}</td>
+                <td className="mono">{fracText(p.failure!.start)}</td>
+                <td className="mono">{fracText(p.failure!.end)}</td>
+                <td colSpan={2}>
+                  无法精确补齐（缺口 {fracText(p.failure!.duration)} 全音符）
+                </td>
+              </tr>
+            ),
+          )}
+        </tbody>
+      </table>
     </div>
   );
 }

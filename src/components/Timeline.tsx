@@ -5,6 +5,7 @@ import {
   VerifyResult,
   toTicks,
 } from "../logic/score";
+import { durationLabel } from "../logic/format";
 
 interface Props {
   result: VerifyResult;
@@ -61,6 +62,7 @@ export function Timeline({ result, colors, stale }: Props) {
           {result.voices.map((v, vi) => {
             const endTicks = toTicks(v.end.end);
             const deficitTicks = targetTicks - endTicks;
+            const fill = result.fillPlan.voices[vi];
             return (
               <div className="track-row" key={`${v.name}-${vi}`}>
                 <div className="track-label" style={{ color: colors[vi % colors.length] }}>
@@ -125,6 +127,24 @@ export function Timeline({ result, colors, stale }: Props) {
                     </div>
                   )}
 
+                  {/* 补齐休止符（与结论清单、下载 JSON 同一份规划结果） */}
+                  {fill?.fillable &&
+                    fill.rests.map((r, ri) => (
+                      <div
+                        key={`rest-${ri}`}
+                        className="rest-block"
+                        style={{
+                          left: xOf(r.start),
+                          width: Math.max(xOf(r.duration), 2),
+                        }}
+                        title={`补齐休止符 · ${v.name} · 小节 ${r.bar} · ${durationLabel(r)} · ${fracText(r.duration)} 全音符`}
+                        data-testid={`rest-block-${vi}`}
+                        data-bar={r.bar}
+                      >
+                        休
+                      </div>
+                    ))}
+
                   {/* 结束位置不在整小节线上的标记 */}
                   {!v.end.onBarLine && (
                     <div className="ragged-end" style={{ left: xOf(v.end.end) }} />
@@ -140,7 +160,8 @@ export function Timeline({ result, colors, stale }: Props) {
       </div>
       <p className="timeline-note">
         最小公共刻度 1/{TICKS_PER_WHOLE} 全音符（全音符分数累加，未使用浮点）。色块为跨小节拆分后的显示片段，
-        同一 id 的片段属于同一事件；斜纹区为该声部距共同小节线的精确差额。
+        同一 id 的片段属于同一事件；斜纹区为该声部距共同小节线的精确差额；
+        灰底「休」块为按最少符号数规划出的补齐休止符（不可补齐的缺口不显示）。
       </p>
     </div>
   );

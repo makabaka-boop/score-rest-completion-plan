@@ -75,6 +75,53 @@ export interface VoiceEnd {
   deficit: Fraction; // 距共同目标终点（maxEnd 之后的下一条小节线）的精确差额
 }
 
+// ---------- 休止符补齐规划 ----------
+
+/** 一枚补齐休止符：落在单个小节内，不跨小节线 */
+export interface RestFill {
+  voiceIndex: number;
+  voiceName: string;
+  bar: number; // 所在实际小节（1 起）
+  start: Fraction; // 起点（自乐曲开头，全音符分数）
+  end: Fraction; // 终点
+  duration: Fraction; // 时值
+  denom: DurationDenominator;
+  dotted: boolean;
+  triplet: boolean;
+}
+
+/** 无法由允许时值精确组成的缺口段 */
+export interface FillFailure {
+  bar: number; // 段所在实际小节（1 起）
+  start: Fraction;
+  end: Fraction;
+  duration: Fraction; // 段长
+}
+
+export interface VoiceFillPlan {
+  voiceIndex: number;
+  voiceName: string;
+  deficit: Fraction; // 到共同目标小节线的精确差额
+  fillable: boolean; // 缺口能否由允许时值精确组成
+  rests: RestFill[]; // fillable 时的完整清单；不可补齐时恒为空（不给貌似对齐的部分清单）
+  failure: FillFailure | null; // 第一段无法精确组成的缺口
+}
+
+export interface FillPlan {
+  targetEnd: Fraction;
+  targetBars: bigint;
+  allFillable: boolean; // 所有有缺口的声部都能精确补齐
+  voices: VoiceFillPlan[];
+}
+
+/** 允许用于补齐的时值属性（与原事件相同：分母 × 附点 × 三连音） */
+export interface DurationSpec {
+  denom: DurationDenominator;
+  dotted: boolean;
+  triplet: boolean;
+  ticks: number; // 时值对应的 1/192 全音符刻度数
+}
+
 export interface BarMismatchError {
   kind: "barMismatch";
   voiceIndex: number;
@@ -111,6 +158,7 @@ export interface VerifyResult {
   endAligned: boolean;
   targetEnd: Fraction; // 共同目标终点
   targetBars: bigint; // 共同目标完整小节数
+  fillPlan: FillPlan; // 休止符补齐规划（与结论、时间轴、JSON 导出共用同一份结果）
 }
 
 // 所有可能时值与拍号长度的最小公共分母：
@@ -212,6 +260,118 @@ function splitSegments(
     if (++guard > 100000) throw new Error("片段拆分异常：循环未收敛");
   }
   return segments;
+}
+
+/**
+ * 允许用于补齐的时值清单：分母 1/2/4/8/16/32 × 附点 × 三连音（与原事件相同）。
+ * 同一刻度只保留写法最简单的一种（无附点、无三连音优先），按刻度从长到短排列，
+ * 保证后续并列时取出的符号唯一。
+ */
+export function allowedRestSpecs(): DurationSpec[] {
+  const byTicks = new Map<number, DurationSpec & { complexity: number }>();
+  for (const denom of DURATION_DENOMINATORS) {
+    for (const dotted of [false, true]) {
+      for (const triplet of [false, true]) {
+        const ticks = toTicks(eventDuration({ denom, dotted, triplet }));
+        const complexity = (dotted ? 1 : 0) + (triplet ? 1 : 0);
+        const prev = byTicks.get(ticks);
+        if (!prev || complexity < prev.complexity) {
+          byTicks.set(ticks, { denom, dotted, triplet, ticks, complexity });
+        }
+      }
+    }
+  }
+  return [...byTicks.values()]
+    .map(({ complexity: _complexity, ...spec }) => spec)
+    .sort((a, b) => b.ticks - a.ticks);
+}
+
+/**
+ * 单段缺口（已按小节边界切好、不跨小节线）的最少符号补齐。
+ * 用 1/192 全音符整数刻度做 DP 求最少符号数；回溯时每一步取仍能达成
+ * 最少符号数的最长时值，实现“符号数并列时从前到后时值较长者优先”，清单唯一。
+ * 无法由允许时值精确组成时返回 null。
+ */
+export function planSegmentRests(gapTicks: number): DurationSpec[] | null {
+  if (!Number.isInteger(gapTicks) || gapTicks < 0) {
+    throw new Error("缺口刻度必须是非负整数");
+  }
+  if (gapTicks === 0) return [];
+  const specs = allowedRestSpecs(); // 已按刻度从长到短排序
+  const dp = new Array<number>(gapTicks + 1).fill(Infinity);
+  dp[0] = 0;
+  for (let t = 1; t <= gapTicks; t++) {
+    for (const s of specs) {
+      if (s.ticks <= t && dp[t - s.ticks] + 1 < dp[t]) dp[t] = dp[t - s.ticks] + 1;
+    }
+  }
+  if (!Number.isFinite(dp[gapTicks])) return null;
+  const out: DurationSpec[] = [];
+  let rem = gapTicks;
+  while (rem > 0) {
+    const pick = specs.find((s) => s.ticks <= rem && dp[rem - s.ticks] === dp[rem] - 1);
+    if (!pick) throw new Error("补齐回溯异常：DP 状态不一致");
+    out.push(pick);
+    rem -= pick.ticks;
+  }
+  return out;
+}
+
+/**
+ * 单个声部的补齐规划：从精确结束位置补到共同目标小节线。
+ * 先按小节边界把缺口拆成若干段，再对每段求最少符号组合；
+ * 任一段无法精确组成时，该声部不生成部分清单，只记录缺口。
+ */
+export function planVoiceFill(
+  voiceIndex: number,
+  voiceName: string,
+  voiceEnd: Fraction,
+  targetEnd: Fraction,
+  barLength: Fraction,
+): VoiceFillPlan {
+  const deficit = sub(targetEnd, voiceEnd);
+  const base = { voiceIndex, voiceName, deficit };
+  if (compare(deficit, ZERO) <= 0) {
+    return { ...base, fillable: true, rests: [], failure: null };
+  }
+  const rests: RestFill[] = [];
+  let cursor = voiceEnd;
+  let guard = 0;
+  while (compare(cursor, targetEnd) < 0) {
+    const bar = Number(floorDiv(cursor, barLength)) + 1;
+    // 段终点 = 本小节线（verifyScore 中 targetEnd 必在小节线上；取 min 以兼容任意目标）
+    const barEnd = mulInt(barLength, bar);
+    const segEnd = compare(barEnd, targetEnd) <= 0 ? barEnd : targetEnd;
+    const specs = planSegmentRests(toTicks(sub(segEnd, cursor)));
+    if (!specs) {
+      return {
+        ...base,
+        fillable: false,
+        rests: [],
+        failure: { bar, start: cursor, end: segEnd, duration: sub(segEnd, cursor) },
+      };
+    }
+    let pos = cursor;
+    for (const s of specs) {
+      const duration = eventDuration(s);
+      const end = add(pos, duration);
+      rests.push({
+        voiceIndex,
+        voiceName,
+        bar,
+        start: pos,
+        end,
+        duration,
+        denom: s.denom,
+        dotted: s.dotted,
+        triplet: s.triplet,
+      });
+      pos = end;
+    }
+    cursor = segEnd;
+    if (++guard > 100000) throw new Error("补齐规划异常：循环未收敛");
+  }
+  return { ...base, fillable: true, rests, failure: null };
 }
 
 function newReportId(): string {
@@ -336,6 +496,17 @@ export function verifyScore(ts: TimeSignatureInput, voices: InputVoice[]): Verif
     (v) => compare(v.end.end, targetEnd) === 0,
   );
 
+  // 休止符补齐规划：与结论、时间轴、JSON 导出共用同一份结果，不改写原事件
+  const fillVoices = voicesWithEnd.map((v, vi) =>
+    planVoiceFill(vi, v.name, v.end.end, targetEnd, barLength),
+  );
+  const fillPlan: FillPlan = {
+    targetEnd,
+    targetBars,
+    allFillable: fillVoices.every((p) => p.fillable),
+    voices: fillVoices,
+  };
+
   return {
     reportId: newReportId(),
     generatedAt: new Date().toISOString(),
@@ -347,6 +518,7 @@ export function verifyScore(ts: TimeSignatureInput, voices: InputVoice[]): Verif
     endAligned,
     targetEnd,
     targetBars,
+    fillPlan,
   };
 }
 
