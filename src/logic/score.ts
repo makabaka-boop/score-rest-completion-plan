@@ -111,6 +111,7 @@ export interface VerifyResult {
   endAligned: boolean;
   targetEnd: Fraction; // 共同目标终点
   targetBars: bigint; // 共同目标完整小节数
+  restPlan: RestPlan; // 休止符补齐规划（与结论同时生成，时间轴/清单/下载共用）
 }
 
 // 所有可能时值与拍号长度的最小公共分母：
@@ -336,7 +337,7 @@ export function verifyScore(ts: TimeSignatureInput, voices: InputVoice[]): Verif
     (v) => compare(v.end.end, targetEnd) === 0,
   );
 
-  return {
+  const assembled: Omit<VerifyResult, "restPlan"> = {
     reportId: newReportId(),
     generatedAt: new Date().toISOString(),
     timeSignature: { numerator: ts.numerator, denominator: ts.denominator },
@@ -348,6 +349,193 @@ export function verifyScore(ts: TimeSignatureInput, voices: InputVoice[]): Verif
     targetEnd,
     targetBars,
   };
+  // 补齐规划与核对结论同源生成，之后清单、时间轴提示、下载 JSON 引用同一份结果
+  return { ...assembled, restPlan: planRestCompletion(assembled) };
+}
+
+// ---------- 休止符补齐规划 ----------
+
+/** 一枚休止符可用的时值属性（与事件时值同一词汇表：分母 × 附点 × 三连音） */
+export interface RestDurationSpec {
+  denom: DurationDenominator;
+  dotted: boolean;
+  triplet: boolean;
+  /** 时值（1/192 全音符整数刻度） */
+  ticks: number;
+}
+
+// 修饰符数量：同一刻度有多个写法时，保留最简者（附点+三连音恒等于无修饰，不进入清单）
+function modifierCount(dotted: boolean, triplet: boolean): number {
+  return (dotted ? 1 : 0) + (triplet ? 1 : 0);
+}
+
+function buildRestDurationTable(): RestDurationSpec[] {
+  const byTicks = new Map<number, RestDurationSpec>();
+  for (const denom of DURATION_DENOMINATORS) {
+    for (const dotted of [false, true]) {
+      for (const triplet of [false, true]) {
+        const ticks = toTicks(eventDuration({ denom, dotted, triplet }));
+        const prev = byTicks.get(ticks);
+        if (
+          !prev ||
+          modifierCount(dotted, triplet) < modifierCount(prev.dotted, prev.triplet)
+        ) {
+          byTicks.set(ticks, { denom, dotted, triplet, ticks });
+        }
+      }
+    }
+  }
+  // 从长到短排列，配合“并列时较长时值优先”的扫描顺序
+  return [...byTicks.values()].sort((a, b) => b.ticks - a.ticks);
+}
+
+/** 全部合法休止符时值（按时值从长到短；同一刻度只保留最简写法） */
+export const REST_DURATION_TABLE: RestDurationSpec[] = buildRestDurationTable();
+
+/** 缺口被小节边界切分出的一段（任何一枚休止符都不得跨过小节线） */
+export interface GapSegment {
+  bar: number; // 段所在实际小节（1 起）
+  start: Fraction; // 段起点（全音符分数）
+  end: Fraction; // 段终点
+  ticks: number; // 段长（1/192 全音符整数刻度）
+}
+
+/** 把 [start, end) 的缺口按小节线拆成若干段（端点按半开区间处理） */
+export function splitGapByBars(
+  start: Fraction,
+  end: Fraction,
+  barLength: Fraction,
+): GapSegment[] {
+  const segments: GapSegment[] = [];
+  let cursor = start;
+  let guard = 0;
+  while (compare(cursor, end) < 0) {
+    const bar = Number(floorDiv(cursor, barLength)) + 1;
+    const barStart = mulInt(barLength, bar - 1);
+    const barEnd = add(barStart, barLength);
+    const segEnd = compare(barEnd, end) <= 0 ? barEnd : end;
+    segments.push({
+      bar,
+      start: cursor,
+      end: segEnd,
+      ticks: toTicks(sub(segEnd, cursor)),
+    });
+    cursor = segEnd;
+    if (++guard > 100000) throw new Error("缺口拆分异常：循环未收敛");
+  }
+  return segments;
+}
+
+// 序列比较：符号数少者优；并列时从前往后时值较长者优。返回负数表示 a 更优。
+function compareRestSeq(a: RestDurationSpec[], b: RestDurationSpec[]): number {
+  if (a.length !== b.length) return a.length - b.length;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i].ticks !== b[i].ticks) return b[i].ticks - a[i].ticks;
+  }
+  return 0;
+}
+
+/**
+ * 用合法休止符时值精确组成 ticks 刻度的一段：
+ * 符号数最少；符号数并列时从前往后时值较长者优先（结果唯一，时值从长到短排列）。
+ * 无法由允许时值精确组成时返回 null。
+ */
+export function fillSegmentTicks(ticks: number): RestDurationSpec[] | null {
+  if (!Number.isInteger(ticks) || ticks < 0) {
+    throw new Error(`段长 ${ticks} 不是非负整数刻度`);
+  }
+  // best[l]：精确组成 l 刻度的最优序列（整数刻度上的动态规划）
+  const best: (RestDurationSpec[] | null)[] = new Array(ticks + 1).fill(null);
+  best[0] = [];
+  for (let l = 1; l <= ticks; l++) {
+    for (const d of REST_DURATION_TABLE) {
+      if (d.ticks > l) continue;
+      const rest = best[l - d.ticks];
+      if (rest === null) continue;
+      const cand = [d, ...rest];
+      const cur = best[l];
+      if (cur === null || compareRestSeq(cand, cur) < 0) best[l] = cand;
+    }
+  }
+  return best[ticks];
+}
+
+/** 补齐清单中的一枚休止符 */
+export interface RestItem {
+  voiceIndex: number;
+  voiceName: string;
+  bar: number; // 所在实际小节（1 起）
+  start: Fraction; // 起点（全音符分数）
+  end: Fraction; // 终点
+  duration: Fraction; // 时值
+  denom: DurationDenominator;
+  dotted: boolean;
+  triplet: boolean;
+}
+
+/** 无法由允许时值精确组成的缺口段 */
+export interface RestGapFailure {
+  voiceIndex: number;
+  voiceName: string;
+  bar: number;
+  start: Fraction;
+  end: Fraction;
+  ticks: number; // 段长（1/192 全音符整数刻度）
+}
+
+export interface RestPlan {
+  /** 所有短声部的缺口都能精确补齐 */
+  ok: boolean;
+  /** 完整补齐清单；存在不可补齐段时为空（不生成貌似对齐的部分清单） */
+  items: RestItem[];
+  failures: RestGapFailure[];
+}
+
+/**
+ * 基于核对结果，为每个短声部从其精确结束位置补到共同目标小节线。
+ * 先按小节边界拆分缺口，再对每段用整数刻度求符号数最少的组合；
+ * 不改写原音符与原核对结论。任一段不可补齐时 items 为空。
+ */
+export function planRestCompletion(result: Omit<VerifyResult, "restPlan">): RestPlan {
+  const items: RestItem[] = [];
+  const failures: RestGapFailure[] = [];
+  result.voices.forEach((v, vi) => {
+    if (compare(v.end.end, result.targetEnd) >= 0) return; // 该声部已到达目标小节线
+    const segments = splitGapByBars(v.end.end, result.targetEnd, result.barLength);
+    for (const seg of segments) {
+      const seq = fillSegmentTicks(seg.ticks);
+      if (seq === null) {
+        failures.push({
+          voiceIndex: vi,
+          voiceName: v.name,
+          bar: seg.bar,
+          start: seg.start,
+          end: seg.end,
+          ticks: seg.ticks,
+        });
+        continue;
+      }
+      let pos = seg.start;
+      for (const d of seq) {
+        const duration = eventDuration(d);
+        const endPos = add(pos, duration);
+        items.push({
+          voiceIndex: vi,
+          voiceName: v.name,
+          bar: seg.bar,
+          start: pos,
+          end: endPos,
+          duration,
+          denom: d.denom,
+          dotted: d.dotted,
+          triplet: d.triplet,
+        });
+        pos = endPos;
+      }
+    }
+  });
+  const ok = failures.length === 0;
+  return { ok, items: ok ? items : [], failures };
 }
 
 // ---------- 导出 JSON（bigint 安全，引用同一份核对结果） ----------

@@ -410,6 +410,23 @@ input[type="text"],
   border-left: 2px dashed var(--bad);
 }
 
+.rest-seg {
+  position: absolute;
+  top: 7px;
+  height: 24px;
+  background: rgba(255, 255, 255, 0.82);
+  border: 1px solid var(--bad);
+  border-radius: 3px;
+  color: var(--bad);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  white-space: nowrap;
+  z-index: 1;
+}
+
 .track-end-label {
   position: absolute;
   top: -16px;

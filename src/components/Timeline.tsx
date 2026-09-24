@@ -1,10 +1,12 @@
 import { useMemo } from "react";
 import { Fraction, fracText, mulInt, sub } from "../logic/fraction";
 import {
+  RestItem,
   TICKS_PER_WHOLE,
   VerifyResult,
   toTicks,
 } from "../logic/score";
+import { durationLabel } from "../logic/format";
 
 interface Props {
   result: VerifyResult;
@@ -23,6 +25,17 @@ export function Timeline({ result, colors, stale }: Props) {
   const bars = useMemo(() => {
     return Array.from({ length: Math.max(targetBars, 1) }, (_, i) => i + 1);
   }, [targetBars]);
+
+  // 补齐休止符提示与结论、下载 JSON 使用同一份规划结果
+  const restsByVoice = useMemo(() => {
+    const map = new Map<number, RestItem[]>();
+    for (const it of result.restPlan.items) {
+      const arr = map.get(it.voiceIndex);
+      if (arr) arr.push(it);
+      else map.set(it.voiceIndex, [it]);
+    }
+    return map;
+  }, [result]);
 
   const xOf = (f: Fraction) => (toTicks(f) / TICKS_PER_WHOLE) * PX_PER_WHOLE;
 
@@ -125,6 +138,24 @@ export function Timeline({ result, colors, stale }: Props) {
                     </div>
                   )}
 
+                  {/* 补齐休止符提示（每枚都不跨小节线） */}
+                  {(restsByVoice.get(vi) ?? []).map((it, ri) => (
+                    <div
+                      key={`rest-${ri}`}
+                      className="rest-seg"
+                      style={{
+                        left: xOf(it.start),
+                        width: Math.max(xOf(it.duration), 2),
+                      }}
+                      title={`休止符 · ${it.voiceName} · 小节 ${it.bar} · ${durationLabel(it)} · ${fracText(it.start)}→${fracText(it.end)} 全音符`}
+                      data-testid="rest-seg"
+                      data-voice={vi}
+                      data-bar={it.bar}
+                    >
+                      休
+                    </div>
+                  ))}
+
                   {/* 结束位置不在整小节线上的标记 */}
                   {!v.end.onBarLine && (
                     <div className="ragged-end" style={{ left: xOf(v.end.end) }} />
@@ -140,7 +171,7 @@ export function Timeline({ result, colors, stale }: Props) {
       </div>
       <p className="timeline-note">
         最小公共刻度 1/{TICKS_PER_WHOLE} 全音符（全音符分数累加，未使用浮点）。色块为跨小节拆分后的显示片段，
-        同一 id 的片段属于同一事件；斜纹区为该声部距共同小节线的精确差额。
+        同一 id 的片段属于同一事件；斜纹区为该声部距共同小节线的精确差额，区内「休」块为规划出的补齐休止符。
       </p>
     </div>
   );

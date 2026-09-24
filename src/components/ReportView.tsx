@@ -1,5 +1,5 @@
 import { VerifyResult, downloadResult } from "../logic/score";
-import { Fraction, fracText, mulInt, sub } from "../logic/fraction";
+import { Fraction, frac, fracText, mulInt, sub } from "../logic/fraction";
 import { beatText, durationLabel } from "../logic/format";
 
 interface Props {
@@ -31,6 +31,7 @@ export function ReportView({ result, stale }: Props) {
 
       <FirstErrorCard result={result} />
       <EndingCard result={result} />
+      <RestPlanCard result={result} />
 
       {result.voices.map((v, vi) => (
         <details key={`${v.name}-${vi}`} className="voice-details">
@@ -138,6 +139,81 @@ function FirstErrorCard({ result }: { result: VerifyResult }) {
           （每个事件的 id 在同一声部内必须唯一）。
         </span>
       )}
+    </div>
+  );
+}
+
+function RestPlanCard({ result }: { result: VerifyResult }) {
+  const plan = result.restPlan;
+  if (plan.ok && plan.items.length === 0) {
+    return (
+      <div className="card ok" data-testid="rest-plan-card">
+        <strong>休止符补齐：</strong>所有声部均已到达共同小节线，无需补齐。
+      </div>
+    );
+  }
+  if (!plan.ok) {
+    return (
+      <div className="card bad" data-testid="rest-plan-card">
+        <strong>无法生成补齐清单：</strong>以下缺口不能由允许时值（分母 1–32、附点、三连音）
+        精确组成；为避免貌似对齐的部分清单，本次不给出任何休止符。
+        <table className="event-table compact deficit-table">
+          <thead>
+            <tr>
+              <th>声部</th>
+              <th>小节</th>
+              <th>缺口起点</th>
+              <th>缺口终点</th>
+              <th>段长</th>
+            </tr>
+          </thead>
+          <tbody>
+            {plan.failures.map((f, i) => (
+              <tr key={`${f.voiceIndex}-${f.bar}-${i}`}>
+                <td>{f.voiceName}</td>
+                <td>{f.bar}</td>
+                <td className="mono">{fracText(f.start)}</td>
+                <td className="mono">{fracText(f.end)}</td>
+                <td className="mono">
+                  {fracText(frac(f.ticks, result.ticksPerWhole))} 全音符
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
+  return (
+    <div className="card ok" data-testid="rest-plan-card">
+      <strong>休止符补齐清单</strong>
+      （可直接照抄：每枚都不跨小节线；各段符号数最少，并列时较长时值在前）：
+      <table className="event-table compact deficit-table" data-testid="rest-plan-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>声部</th>
+            <th>小节</th>
+            <th>起点</th>
+            <th>终点</th>
+            <th>休止符时值</th>
+          </tr>
+        </thead>
+        <tbody>
+          {plan.items.map((it, i) => (
+            <tr key={`${it.voiceIndex}-${i}`} data-testid="rest-plan-row">
+              <td>{i + 1}</td>
+              <td>{it.voiceName}</td>
+              <td>{it.bar}</td>
+              <td className="mono">{fracText(it.start)}</td>
+              <td className="mono">{fracText(it.end)}</td>
+              <td>
+                {durationLabel(it)}（{fracText(it.duration)}）
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
